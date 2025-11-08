@@ -32,6 +32,18 @@ jobs:
           pyinstaller --onefile AFHscraper.py
         shell: bash
 
+      - name: Rename output for OS
+        run: |
+          cd dist
+          if [[ "${{ matrix.os }}" == "ubuntu-22.04" ]]; then
+            mv AFHscraper AFHscraperLinux
+          elif [[ "${{ matrix.os }}" == "macos-latest" ]]; then
+            mv AFHscraper AFHscraperMacOS
+          else
+            mv AFHscraper.exe AFHscraperWindows.exe
+          fi
+        shell: bash
+
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
