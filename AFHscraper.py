@@ -2,6 +2,7 @@ import requests
 from bs4 import BeautifulSoup
 import re
 import os
+import sys
 import time
 from pathlib import Path
 from urllib.parse import quote_plus
@@ -303,10 +304,17 @@ def main():
     mirror_choice = input("Enter choice (1 or 2): ").strip()
     mirror_pref = "Germany" if mirror_choice == '2' else "USA"
     
-    # Initialize scraper
-
+    # First, determine the correct path
+    if getattr(sys, 'frozen', False):
+        # Running as compiled executable
+        download_dir = os.path.dirname(sys.executable)
+    else:
+        # Running as script
+        download_dir = os.path.dirname(os.path.abspath(__file__))
+    
+    # pass the resulting variable to the function
     scraper = AFHScraper(
-        download_dir=os.path.dirname(os.path.abspath(__file__)),
+        download_dir=download_dir,
         mirror_preference=mirror_pref
     )
     
