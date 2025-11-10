@@ -17,8 +17,10 @@ And run the script.
 
 You can also check the [releases](https://github.com/codefl0w/AndroidFileHostScraper/releases) page to download precompiled executables for your platform if you don't want to install Python. Releases are created automatically using GitHub Actions and mostly untested, so please create an issue if you encounter a problem.
 
+Lastly, you can install the PyPi distribution globally by running `pip install AndroidFileHostScraper`. You can then call it via either `AndroidFileHostScraper` or `afhscraper` in your terminal.
+
 ## Usage
-Just run the script, search for keywords, select how the files should be sorted, choose the amount of files to download, select your primary server and hit enter. The scraper will automatically go through the files and download them.
+Just run the tool, search for keywords, select how the files should be sorted, choose the amount of files to download, select your primary server and hit enter. The scraper will automatically go through the files and download them.
 
 Downloads can be found within the root directory of the script.
 
