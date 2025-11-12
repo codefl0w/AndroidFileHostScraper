@@ -5,8 +5,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "AndroidFileHostScraper"
-version = "1.0.3"
-description = "A simple AndroidFileHost scraper for fetching links and metadata."
+version = "2.0.0"
+description = "Simple and powerful Python script to download files from AndroidFileHost by imitating their API calls."
 readme = "README.md"
 license = { text = "Apache-2.0" }
 authors = [
