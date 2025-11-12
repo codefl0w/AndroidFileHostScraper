@@ -67,6 +67,11 @@ AFHScraper V2.0.0 and later can take positional arguements and run like a CLI to
 
 This can be used to automate downloads. It also lets the user to specify an output directory unlike the interactive mode.
 
+For example, to download the first 20 most popular files each from "twrp" and "lineage" searches with 5 threads from a USA server with DEBUG level outputs:
+
+    python AFHscraper.py -s "twrp,lineage" --sort popular -n 20 -t 5 -m usa -l DEBUG
+And so on.
+
 ### Extras
 
 Enjoy my work? Please consider a small donation!
