@@ -1,9 +1,10 @@
-import requests
+import httpx
 from bs4 import BeautifulSoup
 import re
 import os
 import sys
 import time
+import json
 import hashlib
 import logging
 import argparse
@@ -19,7 +20,7 @@ class AFHScraper:
         self.download_dir.mkdir(exist_ok=True)
         self.mirror_preference = mirror_preference
         self.max_retries = max_retries
-        self.session = requests.Session()
+        self.session = httpx.Client()
         self.session.headers.update({
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
         })
@@ -30,6 +31,12 @@ class AFHScraper:
         # Progress tracking for concurrent downloads
         self.progress_lock = threading.Lock()
         self.download_progress = {}  # {thread_id: {'filename': str, 'progress': float}}
+
+    def __enter__(self):
+        return self
+        
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.session.close()
         
     def search_files(self, search_term, page=1, sort_by='date'):
         """Search for files by name with pagination and sorting"""
@@ -140,7 +147,12 @@ class AFHScraper:
             response = self.session.post(mirrors_api, data=post_data, timeout=30)
             response.raise_for_status()
             
-            data = response.json()
+            try:
+                data = response.json()
+            except json.JSONDecodeError:
+                self.logger.error(f"API returned invalid JSON.")
+                self.logger.debug(f"Response text: {response.text}")
+                return []
             
             if data.get('STATUS') != '1' or data.get('CODE') != '200':
                 self.logger.error(f"API returned error: {data.get('MESSAGE')}")
@@ -199,11 +211,9 @@ class AFHScraper:
         # Download a file with MD5 verification and retry logic
         output_path = self.download_dir / filename
         
-        # Check if already downloaded
+        # Check if already downloaded and verified
         if output_path.exists():
             self.logger.info(f"File already exists: {filename}")
-            
-            # Verify MD5
             expected_md5 = self.fetch_md5(fid)
             if expected_md5:
                 self.logger.info(f"Verifying existing file...")
@@ -213,12 +223,11 @@ class AFHScraper:
                     return True
                 else:
                     self.logger.warning(f"MD5 mismatch for existing file. Expected: {expected_md5}, Got: {calculated_md5}")
-                    self.logger.info(f"Deleting corrupted file and re-downloading...")
-                    output_path.unlink()
+                    self.logger.info(f"File is incomplete or corrupted. Resuming download...")
             else:
-                self.logger.info(f"Skipping download (file exists, no MD5 available)")
-                return True
-        
+                 self.logger.info(f"Could not get expected MD5. Assuming file is fine since it exists.")
+                 return True
+
         # Fetch MD5
         self.logger.info(f"Fetching MD5...")
         expected_md5 = self.fetch_md5(fid)
@@ -243,36 +252,28 @@ class AFHScraper:
         self.logger.info(f"Downloading from: {download_url}")
         
         try:
-            response = self.session.get(download_url, stream=True, timeout=120)
-            response.raise_for_status()
-            
-            total_size = int(response.headers.get('content-length', 0))
             downloaded = 0
+            if output_path.exists():
+                downloaded = output_path.stat().st_size
+
+            headers = {'Range': f'bytes={downloaded}-'} if downloaded > 0 else {}
             
-            # Initialize progress tracking for this thread
-            if thread_id is not None:
-                with self.progress_lock:
-                    self.download_progress[thread_id] = {
-                        'filename': filename,
-                        'progress': 0.0
-                    }
-            
-            with open(output_path, 'wb') as f:
-                for chunk in response.iter_content(chunk_size=8192):
-                    if chunk:
-                        f.write(chunk)
-                        downloaded += len(chunk)
-                        if total_size > 0:
-                            progress = (downloaded / total_size) * 100
-                            
-                            if thread_id is not None:
-                                # Update progress for concurrent downloads
-                                with self.progress_lock:
-                                    self.download_progress[thread_id]['progress'] = progress
-                                self._display_concurrent_progress()
-                            else:
-                                # Single download progress
-                                print(f"\r[{filename}] Progress: {progress:.1f}%", end='', flush=True)
+            with self.session.stream("GET", download_url, headers=headers, timeout=120) as response:
+                if response.status_code == 416: # Range Not Satisfiable
+                    self.logger.info(f"File already fully downloaded: {filename}")
+                elif response.status_code == 200 and downloaded > 0: # Server doesn't support range requests
+                    self.logger.warning(f"Server doesn't support range requests. Restarting download.")
+                    output_path.unlink()
+                    downloaded = 0
+                    # Re-request without range header
+                    headers = {}
+                    with self.session.stream("GET", download_url, headers=headers, timeout=120) as new_response:
+                        new_response.raise_for_status()
+                        self._process_download(new_response, output_path, downloaded, thread_id, filename)
+
+                else:
+                    response.raise_for_status()
+                    self._process_download(response, output_path, downloaded, thread_id, filename)
             
             # Clear thread progress
             if thread_id is not None:
@@ -310,8 +311,6 @@ class AFHScraper:
             
         except Exception as e:
             self.logger.error(f"Error downloading: {e}")
-            if output_path.exists():
-                output_path.unlink()
             
             # Clear thread progress on error
             if thread_id is not None:
@@ -326,6 +325,37 @@ class AFHScraper:
                 return self.download_file(fid, filename, retry_count + 1, thread_id)
             
             return False
+
+    def _process_download(self, response, output_path, downloaded, thread_id, filename):
+        total_size = int(response.headers.get('content-length', 0)) + downloaded
+        mode = 'ab' if downloaded > 0 else 'wb'
+
+        if downloaded > 0:
+            self.logger.info(f"Resuming download from {downloaded} bytes")
+        
+        # Initialize progress tracking for this thread
+        if thread_id is not None:
+            with self.progress_lock:
+                self.download_progress[thread_id] = {
+                    'filename': filename,
+                    'progress': (downloaded / total_size) * 100 if total_size > 0 else 0.0
+                }
+
+        with open(output_path, mode) as f:
+            for chunk in response.iter_bytes(chunk_size=8192):
+                f.write(chunk)
+                downloaded += len(chunk)
+                if total_size > 0:
+                    progress = (downloaded / total_size) * 100
+                    
+                    if thread_id is not None:
+                        # Update progress for concurrent downloads
+                        with self.progress_lock:
+                            self.download_progress[thread_id]['progress'] = progress
+                        self._display_concurrent_progress()
+                    else:
+                        # Single download progress
+                        print(f"\r[{filename}] Progress: {progress:.1f}%", end='', flush=True)
     
     def _display_concurrent_progress(self):
         # Display progress for all concurrent downloads on one line
@@ -625,29 +655,28 @@ def main():
     num_pages = (max_files + 14) // 15 if max_files else 1
     
     # Initialize scraper
-    scraper = AFHScraper(
+    with AFHScraper(
         download_dir=download_dir,
         mirror_preference=mirror_pref
-    )
-    
-    logger.info(f"\n{'='*70}")
-    logger.info(f"Download directory: {scraper.download_dir.absolute()}")
-    logger.info(f"Mirror preference: {scraper.mirror_preference}")
-    logger.info(f"Sort by: {'Most popular' if sort_by == 'downloads' else 'Newest'}")
-    logger.info(f"Max files per search: {max_files}")
-    logger.info(f"Concurrent downloads: {threads}")
-    logger.info(f"Search terms: {', '.join(search_terms)}")
-    logger.info(f"{'='*70}")
-    
-    # Start downloading
-    results = scraper.batch_download(
-        search_terms, 
-        num_pages=num_pages, 
-        sort_by=sort_by,
-        max_files=max_files, 
-        delay=3,
-        threads=threads
-    )
+    ) as scraper:
+        logger.info(f"\n{'='*70}")
+        logger.info(f"Download directory: {scraper.download_dir.absolute()}")
+        logger.info(f"Mirror preference: {scraper.mirror_preference}")
+        logger.info(f"Sort by: {'Most popular' if sort_by == 'downloads' else 'Newest'}")
+        logger.info(f"Max files per search: {max_files}")
+        logger.info(f"Concurrent downloads: {threads}")
+        logger.info(f"Search terms: {', '.join(search_terms)}")
+        logger.info(f"{'='*70}")
+        
+        # Start downloading
+        results = scraper.batch_download(
+            search_terms, 
+            num_pages=num_pages, 
+            sort_by=sort_by,
+            max_files=max_files, 
+            delay=3,
+            threads=threads
+        )
     
     # Summary
     successful = sum(1 for r in results if r['success'])
