@@ -24,7 +24,7 @@ AFH is slowly dying, which means a lot of ROMs, kernels and whatnot will be fore
 
 ## Installation
 
-Get the requirements: `pip install requests beautifulsoup4`
+Get the requirements: `pip install httpx h2 beautifulsoup4`
 
 And run the script.
 
