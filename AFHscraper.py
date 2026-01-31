@@ -1,16 +1,16 @@
-import requests
+import httpx
 from bs4 import BeautifulSoup
 import re
 import os
 import sys
 import time
+import json
 import hashlib
 import logging
 import argparse
-import threading
+import asyncio
 from pathlib import Path
 from urllib.parse import quote_plus
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 class AFHScraper:
     def __init__(self, download_dir="afh_archive", mirror_preference="USA", max_retries=2):
@@ -19,20 +19,31 @@ class AFHScraper:
         self.download_dir.mkdir(exist_ok=True)
         self.mirror_preference = mirror_preference
         self.max_retries = max_retries
-        self.session = requests.Session()
-        self.session.headers.update({
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-        })
         
         # Setup logging
         self.logger = logging.getLogger('AFHScraper')
         
         # Progress tracking for concurrent downloads
-        self.progress_lock = threading.Lock()
-        self.download_progress = {}  # {thread_id: {'filename': str, 'progress': float}}
+        self.progress_lock = asyncio.Lock()
+        self.download_progress = {}  # {task_id: {'filename': str, 'progress': float, 'speed': float}}
         
-    def search_files(self, search_term, page=1, sort_by='date'):
-        """Search for files by name with pagination and sorting"""
+        # HTTP client (initialized in __aenter__)
+        self.client = None
+
+    async def __aenter__(self):
+        self.client = httpx.AsyncClient(
+            http2=True,
+            limits=httpx.Limits(max_connections=10, max_keepalive_connections=5),
+            timeout=httpx.Timeout(10.0, connect=10.0, read=120.0, write=30.0, pool=10.0)
+        )
+        return self
+        
+    async def __aexit__(self, exc_type, exc_value, traceback):
+        if self.client:
+            await self.client.aclose()
+        
+    # Search for files by name with pagination and sorting
+    async def search_files(self, search_term, page=1, sort_by='date'):
         encoded_term = quote_plus(search_term)
         search_url = f"{self.base_url}/?w=search&s={encoded_term}&type=files"
         
@@ -45,7 +56,7 @@ class AFHScraper:
         self.logger.info(f"Searching page {page}: {search_url}")
         
         try:
-            response = self.session.get(search_url, timeout=30)
+            response = await self.client.get(search_url)
             response.raise_for_status()
             
             soup = BeautifulSoup(response.text, 'html.parser')
@@ -90,12 +101,12 @@ class AFHScraper:
             self.logger.error(f"Error searching: {e}")
             return []
     
-    def fetch_md5(self, fid):
-        # Fetch MD5 from file's download page
+    # Fetch MD5 from file's download page
+    async def fetch_md5(self, fid):
         file_url = f"{self.base_url}/?fid={fid}"
         
         try:
-            response = self.session.get(file_url, timeout=30)
+            response = await self.client.get(file_url)
             response.raise_for_status()
             
             soup = BeautifulSoup(response.text, 'html.parser')
@@ -115,6 +126,7 @@ class AFHScraper:
             self.logger.error(f"Error fetching MD5: {e}")
             return None
     
+    # Calculate MD5 hash of a file
     def calculate_file_md5(self, filepath):
         md5_hash = hashlib.md5()
         try:
@@ -126,8 +138,8 @@ class AFHScraper:
             self.logger.error(f"Error calculating MD5: {e}")
             return None
     
-    def get_download_mirrors(self, fid):
-        # Get download mirrors for a file via API
+    # Get download mirrors for a file via API
+    async def get_download_mirrors(self, fid):
         mirrors_api = f"{self.base_url}/libs/otf/mirrors.otf.php"
         
         try:
@@ -137,10 +149,15 @@ class AFHScraper:
                 'fid': fid
             }
             
-            response = self.session.post(mirrors_api, data=post_data, timeout=30)
+            response = await self.client.post(mirrors_api, data=post_data)
             response.raise_for_status()
             
-            data = response.json()
+            try:
+                data = response.json()
+            except json.JSONDecodeError:
+                self.logger.error(f"API returned invalid JSON.")
+                self.logger.debug(f"Response text: {response.text}")
+                return []
             
             if data.get('STATUS') != '1' or data.get('CODE') != '200':
                 self.logger.error(f"API returned error: {data.get('MESSAGE')}")
@@ -181,6 +198,7 @@ class AFHScraper:
             self.logger.error(f"Error getting mirrors: {e}")
             return []
     
+    # Select the best mirror based on preference
     def select_mirror(self, mirrors):
         if not mirrors:
             return None
@@ -195,16 +213,24 @@ class AFHScraper:
         
         return mirrors[0]['url']
     
-    def download_file(self, fid, filename, retry_count=0, thread_id=None):
-        # Download a file with MD5 verification and retry logic
+    # Format download speed for display
+    def _format_speed(self, bytes_per_second):
+        if bytes_per_second >= 1024 * 1024:
+            return f"{bytes_per_second / (1024 * 1024):.1f} MB/s"
+        elif bytes_per_second >= 1024:
+            return f"{bytes_per_second / 1024:.1f} KB/s"
+        else:
+            return f"{bytes_per_second:.0f} B/s"
+    
+    # Download a file with MD5 verification, size validation, and retry logic
+    async def download_file(self, fid, filename, retry_count=0, task_id=None):
         output_path = self.download_dir / filename
-        
+        part_path = output_path.with_suffix(output_path.suffix + '.part')
+
         # Check if already downloaded
         if output_path.exists():
             self.logger.info(f"File already exists: {filename}")
-            
-            # Verify MD5
-            expected_md5 = self.fetch_md5(fid)
+            expected_md5 = await self.fetch_md5(fid)
             if expected_md5:
                 self.logger.info(f"Verifying existing file...")
                 calculated_md5 = self.calculate_file_md5(output_path)
@@ -218,10 +244,10 @@ class AFHScraper:
             else:
                 self.logger.info(f"Skipping download (file exists, no MD5 available)")
                 return True
-        
+
         # Fetch MD5
         self.logger.info(f"Fetching MD5...")
-        expected_md5 = self.fetch_md5(fid)
+        expected_md5 = await self.fetch_md5(fid)
         if expected_md5:
             self.logger.info(f"Expected MD5: {expected_md5}")
         else:
@@ -229,7 +255,7 @@ class AFHScraper:
         
         # Get mirrors
         self.logger.info(f"Getting mirrors for: {filename}")
-        mirrors = self.get_download_mirrors(fid)
+        mirrors = await self.get_download_mirrors(fid)
         
         if not mirrors:
             self.logger.error(f"No mirrors found for: {filename}")
@@ -240,57 +266,82 @@ class AFHScraper:
             self.logger.error(f"Could not select mirror for: {filename}")
             return False
         
-        self.logger.info(f"Downloading from: {download_url}")
+        self.logger.info(f"Downloading to: {part_path}")
         
         try:
-            response = self.session.get(download_url, stream=True, timeout=120)
-            response.raise_for_status()
-            
-            total_size = int(response.headers.get('content-length', 0))
             downloaded = 0
+            if part_path.exists():
+                downloaded = part_path.stat().st_size
+                self.logger.info(f"Resuming download from {downloaded} bytes")
+
+            headers = {'Range': f'bytes={downloaded}-'} if downloaded > 0 else {}
             
-            # Initialize progress tracking for this thread
-            if thread_id is not None:
-                with self.progress_lock:
-                    self.download_progress[thread_id] = {
-                        'filename': filename,
-                        'progress': 0.0
-                    }
-            
-            with open(output_path, 'wb') as f:
-                for chunk in response.iter_content(chunk_size=8192):
-                    if chunk:
-                        f.write(chunk)
-                        downloaded += len(chunk)
-                        if total_size > 0:
-                            progress = (downloaded / total_size) * 100
-                            
-                            if thread_id is not None:
-                                # Update progress for concurrent downloads
-                                with self.progress_lock:
-                                    self.download_progress[thread_id]['progress'] = progress
-                                self._display_concurrent_progress()
-                            else:
-                                # Single download progress
-                                print(f"\r[{filename}] Progress: {progress:.1f}%", end='', flush=True)
-            
-            # Clear thread progress
-            if thread_id is not None:
-                with self.progress_lock:
-                    if thread_id in self.download_progress:
-                        del self.download_progress[thread_id]
-                self._display_concurrent_progress()
-            
+            # Track download speed
+            start_time = time.monotonic()
+            last_speed_update = start_time
+            bytes_since_last_update = 0
+            current_speed = 0.0
+            expected_total_size = None
+
+            async with self.client.stream("GET", download_url, headers=headers) as response:
+                if response.status_code == 416:  # Range Not Satisfiable
+                    self.logger.info(f"File already fully downloaded in .part file: {filename}")
+                elif response.status_code == 200 and downloaded > 0:  # Server doesn't support range requests
+                    self.logger.warning(f"Server doesn't support range requests. Restarting download.")
+                    part_path.unlink()
+                    downloaded = 0
+                    start_time = time.monotonic()
+                    async with self.client.stream("GET", download_url) as new_response:
+                        new_response.raise_for_status()
+                        expected_total_size = int(new_response.headers.get('content-length', 0))
+                        await self._process_download(
+                            new_response, part_path, downloaded, task_id, filename,
+                            start_time, expected_total_size
+                        )
+                else:
+                    response.raise_for_status()
+                    content_length = int(response.headers.get('content-length', 0))
+                    expected_total_size = content_length + downloaded
+                    await self._process_download(
+                        response, part_path, downloaded, task_id, filename,
+                        start_time, expected_total_size
+                    )
+
+            # Clear task progress
+            if task_id is not None:
+                async with self.progress_lock:
+                    if task_id in self.download_progress:
+                        del self.download_progress[task_id]
+                await self._display_concurrent_progress()
+
             print()  # New line after progress
             self.logger.info(f"Downloaded: {filename}")
             
+            # File size validation
+            if expected_total_size and expected_total_size > 0:
+                actual_size = part_path.stat().st_size
+                if actual_size != expected_total_size:
+                    self.logger.error(f"Size mismatch! Expected: {expected_total_size}, Got: {actual_size}")
+                    if retry_count < self.max_retries:
+                        self.logger.warning(f"Deleting incomplete file and retrying (attempt {retry_count + 1}/{self.max_retries})...")
+                        part_path.unlink()
+                        await asyncio.sleep(2)
+                        return await self.download_file(fid, filename, retry_count + 1, task_id)
+                    else:
+                        self.logger.error(f"Max retries reached. File may be incomplete!")
+                        part_path.unlink()
+                        return False
+
             # Verify MD5
             if expected_md5:
                 self.logger.info(f"Verifying MD5...")
-                calculated_md5 = self.calculate_file_md5(output_path)
+                calculated_md5 = self.calculate_file_md5(part_path)
                 if calculated_md5:
                     if calculated_md5.lower() == expected_md5.lower():
                         self.logger.info(f"MD5 verified: {calculated_md5}")
+                        # Atomic file rename
+                        os.replace(str(part_path), str(output_path))
+                        self.logger.info(f"Renamed {part_path} to {output_path}")
                         return True
                     else:
                         self.logger.error(f"MD5 MISMATCH! Expected: {expected_md5}, Got: {calculated_md5}")
@@ -298,54 +349,98 @@ class AFHScraper:
                         # Retry logic
                         if retry_count < self.max_retries:
                             self.logger.warning(f"Deleting corrupted file and retrying (attempt {retry_count + 1}/{self.max_retries})...")
-                            output_path.unlink()
-                            time.sleep(2)
-                            return self.download_file(fid, filename, retry_count + 1, thread_id)
+                            part_path.unlink()
+                            await asyncio.sleep(2)
+                            return await self.download_file(fid, filename, retry_count + 1, task_id)
                         else:
                             self.logger.error(f"Max retries reached. File may be corrupted!")
-                            output_path.unlink()
+                            part_path.unlink()
                             return False
-            
+            else:
+                # No MD5 to verify, just rename atomically
+                os.replace(str(part_path), str(output_path))
+                self.logger.info(f"Renamed {part_path} to {output_path}")
+
             return True
-            
+
         except Exception as e:
             self.logger.error(f"Error downloading: {e}")
-            if output_path.exists():
-                output_path.unlink()
             
-            # Clear thread progress on error
-            if thread_id is not None:
-                with self.progress_lock:
-                    if thread_id in self.download_progress:
-                        del self.download_progress[thread_id]
+            # Clear task progress on error
+            if task_id is not None:
+                async with self.progress_lock:
+                    if task_id in self.download_progress:
+                        del self.download_progress[task_id]
             
             # Retry on error
             if retry_count < self.max_retries:
                 self.logger.warning(f"Retrying download (attempt {retry_count + 1}/{self.max_retries})...")
-                time.sleep(2)
-                return self.download_file(fid, filename, retry_count + 1, thread_id)
+                await asyncio.sleep(2)
+                return await self.download_file(fid, filename, retry_count + 1, task_id)
             
             return False
+
+    # Process download stream with speed tracking
+    async def _process_download(self, response, part_path, downloaded, task_id, filename, start_time, expected_total_size):
+        total_size = expected_total_size if expected_total_size else 0
+        mode = 'ab' if downloaded > 0 else 'wb'
+        
+        last_speed_update = start_time
+        bytes_since_last_update = 0
+        current_speed = 0.0
+
+        with open(part_path, mode) as f:
+            async for chunk in response.aiter_bytes(chunk_size=8192):
+                f.write(chunk)
+                chunk_len = len(chunk)
+                downloaded += chunk_len
+                bytes_since_last_update += chunk_len
+                
+                # Update speed every 0.5 seconds
+                now = time.monotonic()
+                time_since_update = now - last_speed_update
+                if time_since_update >= 0.5:
+                    current_speed = bytes_since_last_update / time_since_update
+                    last_speed_update = now
+                    bytes_since_last_update = 0
+                
+                if total_size > 0:
+                    progress = (downloaded / total_size) * 100
+                    speed_str = self._format_speed(current_speed)
+                    
+                    if task_id is not None:
+                        # Update progress for concurrent downloads
+                        async with self.progress_lock:
+                            self.download_progress[task_id] = {
+                                'filename': filename,
+                                'progress': progress,
+                                'speed': current_speed
+                            }
+                        await self._display_concurrent_progress()
+                    else:
+                        # Single download progress
+                        print(f"\r[{filename}] {progress:.1f}% @ {speed_str}", end='', flush=True)
     
-    def _display_concurrent_progress(self):
-        # Display progress for all concurrent downloads on one line
-        with self.progress_lock:
+    # Display progress for all concurrent downloads on one line
+    async def _display_concurrent_progress(self):
+        async with self.progress_lock:
             if not self.download_progress:
                 return
             
             progress_parts = []
-            for thread_id in sorted(self.download_progress.keys()):
-                info = self.download_progress[thread_id]
+            for task_id in sorted(self.download_progress.keys()):
+                info = self.download_progress[task_id]
                 # Truncate filename if too long
-                short_name = info['filename'][:20] + '...' if len(info['filename']) > 23 else info['filename']
-                progress_parts.append(f"[T{thread_id}] {short_name}: {info['progress']:.1f}%")
+                short_name = info['filename'][:15] + '...' if len(info['filename']) > 18 else info['filename']
+                speed_str = self._format_speed(info.get('speed', 0))
+                progress_parts.append(f"[T{task_id}] {short_name}: {info['progress']:.1f}% @ {speed_str}")
             
             progress_line = " | ".join(progress_parts)
             # Clear line and print
-            print(f"\r{progress_line:<150}", end='', flush=True)
+            print(f"\r{progress_line:<180}", end='', flush=True)
     
-    def batch_download(self, search_terms, num_pages=1, sort_by='date', max_files=None, delay=2, threads=1):
-        # Search and download files with optional threading
+    # Search and download files with async concurrency
+    async def batch_download(self, search_terms, num_pages=1, sort_by='date', max_files=None, delay=2, threads=1):
         all_results = []
         
         for term in search_terms:
@@ -360,7 +455,7 @@ class AFHScraper:
                 if max_files and len(files_to_download) >= max_files:
                     break
                 
-                files = self.search_files(term, page=page, sort_by=sort_by)
+                files = await self.search_files(term, page=page, sort_by=sort_by)
                 
                 if not files:
                     self.logger.info(f"No files found on page {page}")
@@ -378,20 +473,20 @@ class AFHScraper:
             
             self.logger.info(f"\nPreparing to download {len(files_to_download)} files")
             
-            # Download files (threaded or sequential)
+            # Download files (concurrent or sequential)
             if threads > 1:
-                self.logger.info(f"Using {threads} concurrent download threads\n")
-                results = self._download_threaded(files_to_download, threads, delay, term)
+                self.logger.info(f"Using {threads} concurrent download tasks\n")
+                results = await self._download_concurrent(files_to_download, threads, delay, term)
             else:
                 self.logger.info(f"Downloading sequentially\n")
-                results = self._download_sequential(files_to_download, delay, term)
+                results = await self._download_sequential(files_to_download, delay, term)
             
             all_results.extend(results)
         
         return all_results
     
-    def _download_sequential(self, files_to_download, delay, search_term):
-        # Download files one by one
+    # Download files one by one
+    async def _download_sequential(self, files_to_download, delay, search_term):
         results = []
         
         for i, file_info in enumerate(files_to_download, 1):
@@ -399,7 +494,7 @@ class AFHScraper:
             self.logger.info(f"  Size: {file_info['size']} | Downloads: {file_info['downloads']} | Date: {file_info['upload_date']}")
             self.logger.info(f"  FID: {file_info['fid']}")
             
-            success = self.download_file(file_info['fid'], file_info['filename'])
+            success = await self.download_file(file_info['fid'], file_info['filename'])
             
             results.append({
                 'search_term': search_term,
@@ -410,60 +505,63 @@ class AFHScraper:
             })
             
             if delay > 0:
-                time.sleep(delay)
+                await asyncio.sleep(delay)
         
         return results
     
-    def _download_threaded(self, files_to_download, threads, delay, search_term):
-        # Download files using thread pool
+    # Download files using async concurrency with semaphore
+    async def _download_concurrent(self, files_to_download, max_concurrent, delay, search_term):
         results = []
-        thread_counter = 0
+        semaphore = asyncio.Semaphore(max_concurrent)
+        task_counter = 0
         
-        def download_task(file_info, index, thread_id):
-            self.logger.info(f"\n[{index}/{len(files_to_download)}] File: {file_info['filename']}")
-            self.logger.info(f"  Size: {file_info['size']} | Downloads: {file_info['downloads']} | Date: {file_info['upload_date']}")
-            self.logger.info(f"  FID: {file_info['fid']}")
-            
-            success = self.download_file(file_info['fid'], file_info['filename'], thread_id=thread_id)
-            
-            if delay > 0:
-                time.sleep(delay)
-            
-            return {
-                'search_term': search_term,
-                'filename': file_info['filename'],
-                'fid': file_info['fid'],
-                'size': file_info['size'],
-                'success': success
-            }
+        async def download_task(file_info, index, task_id):
+            async with semaphore:
+                self.logger.info(f"\n[{index}/{len(files_to_download)}] File: {file_info['filename']}")
+                self.logger.info(f"  Size: {file_info['size']} | Downloads: {file_info['downloads']} | Date: {file_info['upload_date']}")
+                self.logger.info(f"  FID: {file_info['fid']}")
+                
+                success = await self.download_file(file_info['fid'], file_info['filename'], task_id=task_id)
+                
+                if delay > 0:
+                    await asyncio.sleep(delay)
+                
+                return {
+                    'search_term': search_term,
+                    'filename': file_info['filename'],
+                    'fid': file_info['fid'],
+                    'size': file_info['size'],
+                    'success': success
+                }
         
-        with ThreadPoolExecutor(max_workers=threads) as executor:
-            futures = {}
-            for i, file_info in enumerate(files_to_download, 1):
-                thread_counter += 1
-                future = executor.submit(download_task, file_info, i, thread_counter)
-                futures[future] = file_info
-            
-            for future in as_completed(futures):
-                try:
-                    result = future.result()
-                    results.append(result)
-                except Exception as e:
-                    file_info = futures[future]
-                    self.logger.error(f"Thread error for {file_info['filename']}: {e}")
-                    results.append({
-                        'search_term': search_term,
-                        'filename': file_info['filename'],
-                        'fid': file_info['fid'],
-                        'size': file_info['size'],
-                        'success': False
-                    })
+        tasks = []
+        for i, file_info in enumerate(files_to_download, 1):
+            task_counter += 1
+            task = asyncio.create_task(download_task(file_info, i, task_counter))
+            tasks.append(task)
+        
+        # Gather all results
+        completed = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        for i, result in enumerate(completed):
+            if isinstance(result, Exception):
+                file_info = files_to_download[i]
+                self.logger.error(f"Task error for {file_info['filename']}: {result}")
+                results.append({
+                    'search_term': search_term,
+                    'filename': file_info['filename'],
+                    'fid': file_info['fid'],
+                    'size': file_info['size'],
+                    'success': False
+                })
+            else:
+                results.append(result)
         
         return results
 
 
+# Setup logging configuration
 def setup_logging(log_level):
-
     # Create logger
     logger = logging.getLogger('AFHScraper')
     logger.setLevel(getattr(logging, log_level.upper()))
@@ -487,8 +585,8 @@ def setup_logging(log_level):
     return logger
 
 
+# Parse command line arguments
 def parse_arguments():
-
     parser = argparse.ArgumentParser(
         description='AndroidFileHost Scraper by fl0w',
         epilog='If no arguments provided, interactive mode will be used.'
@@ -514,8 +612,8 @@ def parse_arguments():
     return parser.parse_args()
 
 
+# Run in interactive mode
 def interactive_mode():
-    # Run in interactive mode
     print("="*70)
     print("AndroidFileHost Scraper by fl0w")
     print("github.com/codefl0w")
@@ -580,7 +678,8 @@ def interactive_mode():
     }
 
 
-def main():
+# Async main entry point
+async def async_main():
     args = parse_arguments()
     
     # Check if running in CLI mode or interactive mode
@@ -625,35 +724,42 @@ def main():
     num_pages = (max_files + 14) // 15 if max_files else 1
     
     # Initialize scraper
-    scraper = AFHScraper(
+    async with AFHScraper(
         download_dir=download_dir,
         mirror_preference=mirror_pref
-    )
-    
-    logger.info(f"\n{'='*70}")
-    logger.info(f"Download directory: {scraper.download_dir.absolute()}")
-    logger.info(f"Mirror preference: {scraper.mirror_preference}")
-    logger.info(f"Sort by: {'Most popular' if sort_by == 'downloads' else 'Newest'}")
-    logger.info(f"Max files per search: {max_files}")
-    logger.info(f"Concurrent downloads: {threads}")
-    logger.info(f"Search terms: {', '.join(search_terms)}")
-    logger.info(f"{'='*70}")
-    
-    # Start downloading
-    results = scraper.batch_download(
-        search_terms, 
-        num_pages=num_pages, 
-        sort_by=sort_by,
-        max_files=max_files, 
-        delay=3,
-        threads=threads
-    )
-    
+    ) as scraper:
+        scraper.client.headers.update({
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        })
+        logger.info(f"\n{'='*70}")
+        logger.info(f"Download directory: {scraper.download_dir.absolute()}")
+        logger.info(f"Mirror preference: {scraper.mirror_preference}")
+        logger.info(f"Sort by: {'Most popular' if sort_by == 'downloads' else 'Newest'}")
+        logger.info(f"Max files per search: {max_files}")
+        logger.info(f"Concurrent downloads: {threads}")
+        logger.info(f"Search terms: {', '.join(search_terms)}")
+        logger.info(f"{'='*70}")
+
+        # Start downloading
+        results = await scraper.batch_download(
+            search_terms,
+            num_pages=num_pages,
+            sort_by=sort_by,
+            max_files=max_files,
+            delay=3,
+            threads=threads
+        )
+
     # Summary
     successful = sum(1 for r in results if r['success'])
     logger.info(f"\n{'='*70}")
     logger.info(f"Summary: {successful}/{len(results)} files downloaded successfully")
     logger.info(f"{'='*70}")
+
+
+# Main entry point - runs the async main
+def main():
+    asyncio.run(async_main())
 
 
 if __name__ == "__main__":
